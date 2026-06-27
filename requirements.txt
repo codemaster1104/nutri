@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-telegram-bot
+ollama
+sqlalchemy
+apscheduler
+pandas
+scipy
+numpy
