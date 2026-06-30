@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -21,6 +21,7 @@ class User(Base):
     daily_protein_goal = Column(Integer, default=150)
     daily_carb_goal = Column(Integer, default=250)
     daily_fat_goal = Column(Integer, default=70)
+    memory_summary = Column(String, default="")
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -60,6 +61,13 @@ class Reminder(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight migration for existing SQLite databases.
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(users)")).fetchall()
+        column_names = {column[1] for column in columns}
+        if "memory_summary" not in column_names:
+            connection.execute(text("ALTER TABLE users ADD COLUMN memory_summary TEXT DEFAULT ''"))
 
 def get_db():
     db = SessionLocal()

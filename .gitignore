@@ -1,3 +1,5 @@
 .venv
 .agents
 .instructions.md
+.env
+nutri.db
