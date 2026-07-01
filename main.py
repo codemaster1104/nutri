@@ -1,395 +1,32 @@
-import asyncio
-import base64
 import logging
-import json
-import os
-from pathlib import Path
-from datetime import datetime, timedelta, date
-from typing import Optional, Dict, Any
+from datetime import date, datetime, timedelta
 
-import ollama
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
-from sqlalchemy.orm import Session
 from sqlalchemy import select
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-from database import init_db, SessionLocal, engine, User, Log, Reminder
-import bot_tools
-from data_processor import generate_weekly_report
-
-# Configuration
-# Read sensitive config from environment to avoid committing secrets.
-def load_env_file(env_path: str = ".env") -> None:
-    """Load simple KEY=VALUE pairs from a local .env file if present."""
-    path = Path(env_path)
-    if not path.exists():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-load_env_file()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", OLLAMA_MODEL)
-PROACTIVE_HOURS = 6
-DAILY_RECAP_HOUR_UTC = 20
-
-PENDING_CLARIFICATIONS: Dict[int, Dict[str, Any]] = {}
-
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+from config import (
+    DAILY_RECAP_HOUR_UTC,
+    OLLAMA_MODEL,
+    OLLAMA_VISION_MODEL,
+    PROACTIVE_HOURS,
+    TELEGRAM_BOT_TOKEN,
+    VISION_SYSTEM_PROMPT,
 )
+from data_processor import generate_weekly_report
+from database import Log, Reminder, SessionLocal, User, init_db
+from services.message_service import encode_image_bytes, pop_pending_clarification, process_user_message
+from tools import bot_tools
+
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Nutri Omnipresent Nutritionist", version="1.0.0")
 bot_app = None
 scheduler = AsyncIOScheduler(timezone="UTC")
-
-TOOL_INSTRUCTIONS = (
-    "You are a professional, friendly, and empathetic nutritionist."
-    " Use the available tools whenever the user asks to log food or activity, update goals, or query summaries."
-    " When you decide a tool must be called, return only valid JSON with keys 'tool' and 'args'."
-    " Example: {\"tool\": \"log_food\", \"args\": {\"description\": \"salad\", \"calories\": 180}}."
-    " If no tool is needed, answer naturally without JSON."
-    " The supported tools are:"
-    " log_food(description, calories, protein, carbs, fat, amount, unit),"
-    " log_activity(description, calories_burned, duration, unit),"
-    " get_daily_summary(date),"
-    " update_user_goals(calorie_goal, protein_goal, carb_goal, fat_goal),"
-    " get_user_profile(),"
-    " query_logs(start_date, end_date),"
-    " set_reminder(trigger_time, message)."
-)
-
-SYSTEM_PROMPT = (
-    "You are an omnipresent nutritionist who is caring, practical, and supportive. "
-    "You know when to call tools to log nutrition, fetch summaries, or update user plans. "
-    "If you call a tool, the response must be pure JSON with fields tool and args. "
-    "If you do not need a tool, answer conversationally. "
-    + TOOL_INSTRUCTIONS
-)
-
-VISION_SYSTEM_PROMPT = (
-    "You are an omnipresent nutritionist who can inspect images of food and activity. "
-    "If the image shows food, estimate what it is and whether a log_food tool call is appropriate. "
-    "If the food, portion, or preparation is unclear, do not finalize the log yet. Ask a short clarifying question first, "
-    "and mention the most likely options if that helps, such as '100 g cooked rice' or 'whey protein in water'. "
-    "If the image shows exercise or another activity, estimate whether a log_activity tool call is appropriate. "
-    "If you need a tool, return pure JSON with fields tool and args. "
-    "If you need clarification first, return pure JSON with fields action, question, and optional options. "
-    "Use action=\"clarify\" when you are not confident enough to finalize the macros or activity details. "
-    "Otherwise answer conversationally. "
-    + TOOL_INSTRUCTIONS
-)
-
-
-async def summarize_memory(memory_summary: str, user_message: str, assistant_reply: str) -> str:
-    """Create a short rolling memory summary for the user."""
-    prompt = (
-        "Update the long-term memory for a nutrition assistant. Keep it short, factual, and useful. "
-        "Capture stable preferences, goals, habits, and important reminders only. "
-        "Do not include casual chit-chat. Return at most 4 bullet-like sentences as plain text.\n\n"
-        f"Existing memory:\n{memory_summary or 'None'}\n\n"
-        f"Latest user message:\n{user_message}\n\n"
-        f"Assistant reply:\n{assistant_reply}"
-    )
-    messages = [
-        {"role": "system", "content": "You are a concise memory summarizer for a nutrition chatbot."},
-        {"role": "user", "content": prompt},
-    ]
-    return (await chat_with_llm(messages)).strip()
-
-
-def encode_image_bytes(image_bytes: bytes) -> str:
-    """Convert raw image bytes into base64 for Ollama vision input."""
-    return base64.b64encode(image_bytes).decode("utf-8")
-
-
-def build_tool_reply(tool_name: str, tool_response: Any, args: Dict[str, Any]) -> str:
-    """Convert tool output into a short, natural-language chat reply."""
-    if tool_name == "log_food":
-        description = args.get("description", "that meal")
-        return f"Logged {description} for you."
-
-    if tool_name == "log_activity":
-        description = args.get("description", "that activity")
-        return f"Logged {description}."
-
-    if tool_name == "set_reminder":
-        trigger_time = args.get("trigger_time")
-        if trigger_time:
-            return f"Reminder set for {trigger_time}."
-        return "Reminder set."
-
-    if tool_name == "update_user_goals":
-        return str(tool_response)
-
-    if tool_name == "get_daily_summary" and isinstance(tool_response, dict):
-        return (
-            f"Today's summary: {tool_response.get('total_calories', 0)} kcal net, "
-            f"{tool_response.get('protein', 0)} g protein, {tool_response.get('carbs', 0)} g carbs, "
-            f"{tool_response.get('fat', 0)} g fat."
-        )
-
-    if tool_name == "get_user_profile" and isinstance(tool_response, dict):
-        goals = tool_response.get("goals", {})
-        return (
-            f"Your current goals are {goals.get('calories', 0)} kcal, "
-            f"{goals.get('protein', 0)} g protein, {goals.get('carbs', 0)} g carbs, and {goals.get('fat', 0)} g fat."
-        )
-
-    if tool_name == "query_logs":
-        return "I pulled your recent logs."
-
-    return "Done."
-
-
-async def chat_with_llm(messages: list[Dict[str, str]], model: Optional[str] = None) -> str:
-    try:
-        resolved_model = model or OLLAMA_MODEL
-        if not resolved_model:
-            raise RuntimeError("OLLAMA_MODEL is not set")
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model=resolved_model,
-            messages=messages,
-        )
-        if isinstance(response, dict):
-            message = response.get("message")
-            if isinstance(message, dict):
-                return message.get("content", "")
-            return response.get("content", "") or ""
-
-        message = getattr(response, "message", None)
-        if message is not None:
-            content = getattr(message, "content", None)
-            if content:
-                return content
-
-        content = getattr(response, "content", None)
-        if content:
-            return content
-
-        if hasattr(response, "model_dump"):
-            dumped = response.model_dump()
-            message = dumped.get("message") if isinstance(dumped, dict) else None
-            if isinstance(message, dict):
-                return message.get("content", "")
-            return dumped.get("content", "") if isinstance(dumped, dict) else ""
-
-        return str(response)
-    except Exception as e:
-        logger.error("Ollama error: %s", e)
-        return "I'm having trouble connecting to my brain right now. Please try again later!"
-
-
-def parse_tool_call(response_text: str) -> Optional[Dict[str, Any]]:
-    text = response_text.strip()
-    if not text:
-        return None
-    try:
-        candidate = json.loads(text)
-        if isinstance(candidate, dict) and 'tool' in candidate and 'args' in candidate:
-            return candidate
-    except json.JSONDecodeError:
-        pass
-
-    # Simple fallback for messy JSON
-    if '"tool"' in text and '"args"' in text:
-        try:
-            start = text.index('{')
-            end = text.rindex('}')
-            candidate = json.loads(text[start:end+1])
-            if isinstance(candidate, dict) and 'tool' in candidate and 'args' in candidate:
-                return candidate
-        except Exception:
-            return None
-    return None
-
-
-def parse_structured_reply(response_text: str) -> Optional[Dict[str, Any]]:
-    text = response_text.strip()
-    if not text:
-        return None
-    try:
-        candidate = json.loads(text)
-        if isinstance(candidate, dict):
-            return candidate
-    except json.JSONDecodeError:
-        pass
-
-    if '{' in text and '}' in text:
-        try:
-            start = text.index('{')
-            end = text.rindex('}')
-            candidate = json.loads(text[start:end + 1])
-            if isinstance(candidate, dict):
-                return candidate
-        except Exception:
-            return None
-    return None
-
-
-def parse_requested_date(requested_date: Optional[str]) -> Optional[date]:
-    """Parse tool dates that may be ISO strings or simple relative words."""
-    if not requested_date:
-        return None
-
-    normalized = str(requested_date).strip().lower()
-    if normalized in {"today", "now"}:
-        return None
-    if normalized == "yesterday":
-        return date.today() - timedelta(days=1)
-    if normalized == "tomorrow":
-        return date.today() + timedelta(days=1)
-
-    try:
-        return date.fromisoformat(normalized)
-    except ValueError:
-        return None
-
-
-async def run_llm_with_optional_images(
-    system_prompt: str,
-    user_text: str,
-    memory_summary: str,
-    image_b64s: Optional[list[str]] = None,
-    model: Optional[str] = None,
-) -> str:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"User memory summary:\n{memory_summary or 'No long-term memory yet.'}"},
-        {"role": "user", "content": user_text or "Analyze the image and respond helpfully."},
-    ]
-
-    if image_b64s:
-        messages[-1]["images"] = image_b64s
-
-    return await chat_with_llm(messages, model=model)
-
-
-async def process_user_message(
-    user_id: int,
-    username: str,
-    user_text: str,
-    image_b64s: Optional[list[str]] = None,
-    system_prompt: str = SYSTEM_PROMPT,
-    model: Optional[str] = None,
-) -> str:
-    with SessionLocal() as db:
-        user = db.get(User, user_id)
-        if not user:
-            user = User(user_id=user_id, username=username or "Unknown")
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-
-        memory_summary = user.memory_summary or ""
-
-        llm_reply = await run_llm_with_optional_images(
-            system_prompt=system_prompt,
-            user_text=user_text,
-            memory_summary=memory_summary,
-            image_b64s=image_b64s,
-            model=model,
-        )
-        structured_reply = parse_structured_reply(llm_reply)
-
-        if image_b64s and isinstance(structured_reply, dict):
-            if structured_reply.get('action') == 'clarify' or structured_reply.get('needs_clarification') is True:
-                clarification_question = str(
-                    structured_reply.get('question')
-                    or structured_reply.get('clarification_question')
-                    or 'I am not fully sure what this is. Can you clarify what it was and roughly how much there was?'
-                ).strip()
-                options = structured_reply.get('options')
-                if isinstance(options, list) and options:
-                    option_text = '\n'.join(f"- {option}" for option in options if option)
-                    clarification_question = f"{clarification_question}\n\nPossible options:\n{option_text}"
-
-                PENDING_CLARIFICATIONS[user_id] = {
-                    'image_b64s': image_b64s,
-                    'system_prompt': system_prompt,
-                    'model': model,
-                    'original_text': user_text,
-                    'question': clarification_question,
-                }
-                return clarification_question
-
-        tool_call = parse_tool_call(llm_reply)
-        if not tool_call:
-            final_reply = llm_reply
-        else:
-            tool_name = tool_call['tool']
-            args = tool_call.get('args', {})
-            tool_response = ""
-
-            if tool_name == 'log_food':
-                tool_response = bot_tools.log_food(
-                    db,
-                    user_id,
-                    description=args.get('description', ''),
-                    calories=float(args.get('calories', 0)),
-                    protein=float(args.get('protein', 0)),
-                    carbs=float(args.get('carbs', 0)),
-                    fat=float(args.get('fat', 0)),
-                    amount=float(args.get('amount', 1)),
-                    unit=args.get('unit', 'portion'),
-                )
-            elif tool_name == 'log_activity':
-                tool_response = bot_tools.log_activity(
-                    db,
-                    user_id,
-                    description=args.get('description', ''),
-                    calories_burned=float(args.get('calories_burned', 0)),
-                    duration=float(args.get('duration', 0)),
-                    unit=args.get('unit', 'min'),
-                )
-            elif tool_name == 'get_daily_summary':
-                requested_date = args.get('date')
-                target_date = parse_requested_date(requested_date)
-                tool_response = bot_tools.get_daily_summary(db, user_id, target_date)
-            elif tool_name == 'update_user_goals':
-                tool_response = bot_tools.update_user_goals(
-                    db,
-                    user_id,
-                    calorie_goal=args.get('calorie_goal'),
-                    protein_goal=args.get('protein_goal'),
-                    carb_goal=args.get('carb_goal'),
-                    fat_goal=args.get('fat_goal'),
-                )
-            elif tool_name == 'get_user_profile':
-                tool_response = bot_tools.get_user_profile(db, user_id)
-            elif tool_name == 'query_logs':
-                start_date = datetime.fromisoformat(args.get('start_date')) if args.get('start_date') else datetime.utcnow() - timedelta(days=7)
-                end_date = datetime.fromisoformat(args.get('end_date')) if args.get('end_date') else datetime.utcnow()
-                tool_response = bot_tools.query_logs(db, user_id, start_date, end_date)
-            elif tool_name == 'set_reminder':
-                trigger_time = datetime.fromisoformat(args.get('trigger_time')) if args.get('trigger_time') else datetime.utcnow()
-                tool_response = bot_tools.set_reminder(db, user_id, trigger_time, args.get('message', 'Reminder from Nutri'))
-            else:
-                tool_response = f"I don't have a tool named {tool_name}."
-
-            final_reply = build_tool_reply(tool_name, tool_response, args)
-
-        updated_memory = await summarize_memory(memory_summary, user_text, final_reply)
-        if updated_memory and updated_memory != memory_summary:
-            bot_tools.update_memory_summary(db, user_id, updated_memory)
-
-        return final_reply
 
 
 async def send_bot_message(chat_id: int, text: str):
@@ -410,7 +47,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_record = User(user_id=user.id, username=user.username or user.first_name or "Unknown")
             db.add(user_record)
             db.commit()
-            db.refresh(user_record)
 
     await update.message.reply_text(
         f"Hello {user.first_name}! I am your omnipresent nutritionist. 🍎\n"
@@ -468,7 +104,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
-    args = text.replace('/setgoal', '').strip().split()
+    args = text.replace("/setgoal", "").strip().split()
     parsed = {}
     for i in range(0, len(args) - 1, 2):
         key = args[i].lower()
@@ -476,14 +112,14 @@ async def setgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value = int(args[i + 1])
         except ValueError:
             continue
-        if key in ('calorie', 'calories'):
-            parsed['calorie_goal'] = value
-        elif key in ('protein',):
-            parsed['protein_goal'] = value
-        elif key in ('carb', 'carbs'):
-            parsed['carb_goal'] = value
-        elif key in ('fat',):
-            parsed['fat_goal'] = value
+        if key in ("calorie", "calories"):
+            parsed["calorie_goal"] = value
+        elif key == "protein":
+            parsed["protein_goal"] = value
+        elif key in ("carb", "carbs"):
+            parsed["carb_goal"] = value
+        elif key == "fat":
+            parsed["fat_goal"] = value
 
     if not parsed:
         await update.message.reply_text("Usage: /setgoal calorie 2000 protein 120 carbs 220 fat 70")
@@ -497,7 +133,7 @@ async def setgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
-    parts = text.replace('/reminder', '').strip().split(' ', 1)
+    parts = text.replace("/reminder", "").strip().split(" ", 1)
     if len(parts) < 2:
         await update.message.reply_text("Usage: /reminder <ISO timestamp> <message>")
         return
@@ -519,7 +155,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or "Unknown"
 
-    pending_clarification = PENDING_CLARIFICATIONS.pop(user_id, None)
+    pending_clarification = pop_pending_clarification(user_id)
     if pending_clarification:
         clarification_text = (
             f"Previous question: {pending_clarification.get('question', '')}\n"
@@ -531,9 +167,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id,
             username,
             clarification_text,
-            image_b64s=pending_clarification.get('image_b64s'),
-            system_prompt=pending_clarification.get('system_prompt', VISION_SYSTEM_PROMPT),
-            model=pending_clarification.get('model', OLLAMA_VISION_MODEL),
+            image_b64s=pending_clarification.get("image_b64s"),
+            system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
+            model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
         )
         await update.message.reply_text(reply_text)
         return
@@ -591,8 +227,8 @@ async def check_proactive_logging():
             if not last_log or last_log.timestamp < cutoff:
                 recent_check = db.query(Reminder).filter(
                     Reminder.user_id == user.user_id,
-                    Reminder.message.like('%log your latest meal%'),
-                    Reminder.trigger_time >= cutoff
+                    Reminder.message.like("%log your latest meal%"),
+                    Reminder.trigger_time >= cutoff,
                 ).order_by(Reminder.trigger_time.desc()).first()
                 if recent_check:
                     continue
@@ -624,7 +260,7 @@ async def send_daily_recap():
                 f"Carbs: {summary['carbs']} g\n"
                 f"Fat: {summary['fat']} g\n"
                 f"Entries: {summary['entry_count']}\n"
-                "Keep going—you’re doing great! 💪"
+                "Keep going-you're doing great!"
             )
             await send_bot_message(user.user_id, recap)
 
@@ -653,22 +289,36 @@ async def start_bot() -> None:
 @app.on_event("startup")
 async def startup_event():
     init_db()
-    # Validate required configuration before starting the bot
     if TELEGRAM_BOT_TOKEN in (None, "", "YOUR_TELEGRAM_BOT_TOKEN"):
-        logger.error(
-            "TELEGRAM_BOT_TOKEN is not set. Please set the environment variable TELEGRAM_BOT_TOKEN and restart."
-        )
+        logger.error("TELEGRAM_BOT_TOKEN is not set. Please set TELEGRAM_BOT_TOKEN and restart.")
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
     if not OLLAMA_MODEL:
-        logger.error(
-            "OLLAMA_MODEL is not set. Please set the environment variable OLLAMA_MODEL and restart."
-        )
+        logger.error("OLLAMA_MODEL is not set. Please set OLLAMA_MODEL and restart.")
         raise RuntimeError("Missing OLLAMA_MODEL environment variable")
 
     await start_bot()
-    scheduler.add_job(process_scheduled_reminders, 'interval', minutes=1, id='scheduled_reminders', replace_existing=True)
-    scheduler.add_job(check_proactive_logging, 'interval', minutes=10, id='proactive_logging', replace_existing=True)
-    scheduler.add_job(send_daily_recap, 'cron', hour=DAILY_RECAP_HOUR_UTC, minute=0, id='daily_recap', replace_existing=True)
+    scheduler.add_job(
+        process_scheduled_reminders,
+        "interval",
+        minutes=1,
+        id="scheduled_reminders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        check_proactive_logging,
+        "interval",
+        minutes=10,
+        id="proactive_logging",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_daily_recap,
+        "cron",
+        hour=DAILY_RECAP_HOUR_UTC,
+        minute=0,
+        id="daily_recap",
+        replace_existing=True,
+    )
     scheduler.start()
 
 
@@ -693,4 +343,5 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
