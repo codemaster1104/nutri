@@ -72,6 +72,11 @@ def _parse_optional_datetime(raw_value: Optional[str], default_value: datetime) 
         return default_value
 
 
+def _is_today_request(user_text: str) -> bool:
+    normalized = (user_text or "").lower()
+    return "today" in normalized or "todays" in normalized or "today's" in normalized
+
+
 async def process_user_message(
     user_id: int,
     username: str,
@@ -149,7 +154,10 @@ async def process_user_message(
                     unit=args.get("unit", "min"),
                 )
             elif tool_name == "get_daily_summary":
-                target_date = parse_requested_date(args.get("date"))
+                if _is_today_request(user_text):
+                    target_date = None
+                else:
+                    target_date = parse_requested_date(args.get("date"))
                 tool_response = bot_tools.get_daily_summary(db, user_id, target_date)
             elif tool_name == "update_user_goals":
                 tool_response = bot_tools.update_user_goals(
