@@ -170,6 +170,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or "Unknown"
 
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+    except Exception:
+        pass
+    status_message = await message.reply_text("🤔 Thinking...")
+
     pending_clarification = pop_pending_clarification(user_id)
     if pending_clarification:
         clarification_text = (
@@ -186,11 +192,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
             model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
         )
-        await message.reply_text(reply_text)
+        await status_message.edit_text(reply_text)
         return
 
     reply_text = await process_user_message(user_id, username, user_text)
-    await message.reply_text(reply_text)
+    await status_message.edit_text(reply_text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,6 +204,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None or not message.photo:
         return
+
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+    except Exception:
+        pass
+    status_message = await message.reply_text("📸 Analyzing image...")
 
     caption = message.caption or ""
     photo = message.photo[-1]
@@ -213,7 +225,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system_prompt=VISION_SYSTEM_PROMPT,
         model=OLLAMA_VISION_MODEL,
     )
-    await message.reply_text(reply_text)
+    await status_message.edit_text(reply_text)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):

@@ -111,6 +111,33 @@ def _product_title(product: dict[str, Any]) -> str:
     )
 
 
+# Words too short or generic to use for relevance matching.
+_STOP_WORDS = frozenset({"of", "the", "a", "an", "and", "or", "in", "with", "for", "is", "are"})
+
+
+def _is_relevant_match(product: dict[str, Any], query: str) -> bool:
+    """Return True if the product has at least one meaningful keyword in common with the query."""
+    query_words = {
+        w for w in query.lower().split()
+        if len(w) > 2 and w not in _STOP_WORDS
+    }
+    if not query_words:
+        return True  # Can't filter, let it through.
+
+    # Build a single searchable string from all relevant product fields.
+    searchable = " ".join(
+        part.lower()
+        for part in [
+            _product_title(product),
+            product.get("brands") or "",
+            product.get("categories") or "",
+            product.get("generic_name") or "",
+        ]
+        if part
+    )
+    return any(word in searchable for word in query_words)
+
+
 def _product_match(product: dict[str, Any], portion_grams: float | None) -> dict[str, Any]:
     nutriments = _extract_nutriments(product)
     scaled_nutriments = _scale_nutriments(nutriments, portion_grams)
@@ -178,7 +205,10 @@ def search_online_nutrition(db: Session, user_id: int, query: str, portion_grams
         }
 
     products = search_payload.get("products") or []
-    results = [_product_match(product, portion_grams) for product in products[:limit]]
+    # Filter out results with no keyword overlap with the query — avoids returning
+    # completely irrelevant products (e.g. "Fromage Blanc" for a search for "amul paneer").
+    relevant_products = [p for p in products if _is_relevant_match(p, cleaned_query)]
+    results = [_product_match(product, portion_grams) for product in relevant_products[:limit]]
 
     return {
         "query": cleaned_query,
