@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -58,7 +59,9 @@ def _off_get_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
     try:
         with urlopen(request, timeout=10) as response:
             payload = response.read().decode("utf-8")
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+    except HTTPError as exc:
+        return {"error": str(exc), "status_code": exc.code, "url": url}
+    except (URLError, TimeoutError, ValueError) as exc:
         return {"error": str(exc), "url": url}
 
     try:
@@ -139,21 +142,36 @@ def search_online_nutrition(db: Session, user_id: int, query: str, portion_grams
         }
 
     limit = max(1, min(int(max_results), 5))
+    # Prefer the stable v2 Search API; fall back to the legacy CGI endpoint on failure.
     search_payload = _off_get_json(
-        "/cgi/search.pl",
+        "/api/v2/search",
         {
             "search_terms": cleaned_query,
-            "search_simple": 1,
-            "action": "process",
             "json": 1,
             "page_size": limit,
+            "fields": "product_name,product_name_en,generic_name,generic_name_en,product_name_fr,brands,url,categories,serving_size,serving_quantity,nutriments,nutriscore_grade,nutrition_grade_fr",
         },
     )
+
+    if search_payload.get("error") or search_payload.get("status_code") in (503, 502, 500):
+        # Wait before retrying to avoid hammering the server.
+        time.sleep(2)
+        search_payload = _off_get_json(
+            "/cgi/search.pl",
+            {
+                "search_terms": cleaned_query,
+                "search_simple": 1,
+                "action": "process",
+                "json": 1,
+                "page_size": limit,
+            },
+        )
 
     if search_payload.get("error"):
         return {
             "query": cleaned_query,
             "source": "openfoodfacts",
+            "status_code": search_payload.get("status_code"),
             "error": search_payload["error"],
             "url": search_payload.get("url", ""),
             "results": [],

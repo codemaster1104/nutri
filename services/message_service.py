@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 from config import SYSTEM_PROMPT
 from database import SessionLocal, User
 from services.llm_service import (
+    chat_with_llm,
     parse_requested_date,
     parse_structured_reply,
     parse_tool_call,
@@ -62,11 +63,13 @@ def build_tool_reply(tool_name: str, tool_response: Any, args: Dict[str, Any]) -
 
     if tool_name == "search_online_nutrition" and isinstance(tool_response, dict):
         if tool_response.get("error"):
-            return f"I could not look up nutrition data online: {tool_response.get('error')}"
+            # Signal to the caller that a LLM fallback is needed.
+            return None
 
         results = tool_response.get("results") or []
         if not results:
-            return f'I could not find a close nutrition match for "{tool_response.get("query", "")}".'
+            # Signal to the caller that a LLM fallback is needed.
+            return None
 
         top_match = results[0]
         nutriments = top_match.get("nutriments_for_portion") or top_match.get("nutriments_per_100g") or {}
@@ -114,6 +117,22 @@ def _parse_optional_datetime(raw_value: Optional[str], default_value: datetime) 
 def _is_today_request(user_text: str) -> bool:
     normalized = (user_text or "").lower()
     return "today" in normalized or "todays" in normalized or "today's" in normalized
+
+
+async def _llm_nutrition_fallback(query: str, portion_grams: Optional[float]) -> str:
+    """Ask the local LLM to estimate nutrition when the online database is unavailable."""
+    portion_note = f" for a {portion_grams} g portion" if portion_grams else " per 100 g"
+    prompt = (
+        f"The nutrition database is temporarily unavailable. "
+        f"Based on your training knowledge, give a concise nutrition estimate for: \"{query}\"{portion_note}. "
+        "Provide approximate calories, protein, carbs, and fat. "
+        "Keep it short (2–3 sentences) and clearly label it as an estimate since the live database is down."
+    )
+    messages = [
+        {"role": "system", "content": "You are a knowledgeable nutritionist. Provide helpful, accurate estimates."},
+        {"role": "user", "content": prompt},
+    ]
+    return await chat_with_llm(messages)
 
 
 async def process_user_message(
@@ -223,6 +242,20 @@ async def process_user_message(
                     portion_grams=args.get("portion_grams"),
                     max_results=int(args.get("max_results", 3) or 3),
                 )
+                # If the online lookup failed or returned no results, fall back to LLM knowledge.
+                needs_llm_fallback = isinstance(tool_response, dict) and (
+                    tool_response.get("error")
+                    or not tool_response.get("results")
+                )
+                if needs_llm_fallback:
+                    final_reply = await _llm_nutrition_fallback(
+                        query=args.get("query", ""),
+                        portion_grams=args.get("portion_grams"),
+                    )
+                    updated_memory = await summarize_memory(memory_summary, user_text, final_reply)
+                    if updated_memory and updated_memory != memory_summary:
+                        bot_tools.update_memory_summary(db, user_id, updated_memory)
+                    return final_reply
             elif tool_name == "set_reminder":
                 raw_trigger_time = args.get("trigger_time")
                 if not raw_trigger_time:
@@ -243,6 +276,12 @@ async def process_user_message(
                 tool_response = f"I don't have a tool named {tool_name}."
 
             final_reply = build_tool_reply(tool_name, tool_response, args)
+            # Safety net: build_tool_reply returns None when the search lookup needs LLM fallback.
+            if final_reply is None and tool_name == "search_online_nutrition":
+                final_reply = await _llm_nutrition_fallback(
+                    query=args.get("query", ""),
+                    portion_grams=args.get("portion_grams"),
+                )
 
         updated_memory = await summarize_memory(memory_summary, user_text, final_reply)
         if updated_memory and updated_memory != memory_summary:
