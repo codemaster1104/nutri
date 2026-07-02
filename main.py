@@ -48,46 +48,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.add(user_record)
             db.commit()
 
-    await update.message.reply_text(
-        f"Hello {user.first_name}! I am your omnipresent nutritionist. 🍎\n"
-        "I can track your calories, activities, and help you stay on target. "
-        "Tell me what you ate or what exercise you completed, or try /summary to see today's totals."
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            f"Hello {user.first_name}! I am your omnipresent nutritionist. 🍎\n"
+            "I can track your calories, activities, and help you stay on target. "
+            "Tell me what you ate or what exercise you completed, or try /summary to see today's totals."
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start - Begin or refresh your profile\n"
-        "/summary - Today's nutrition summary\n"
-        "/profile - View your goals and settings\n"
-        "/report - Generate a 7-day trend report\n"
-        "/setgoal calorie 2000 protein 120 carbs 220 fat 70\n"
-        "/reminder 2026-06-28T18:30:00 Your afternoon snack reminder"
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "/start - Begin or refresh your profile\n"
+            "/summary - Today's nutrition summary\n"
+            "/profile - View your goals and settings\n"
+            "/report - Generate a 7-day trend report\n"
+            "/setgoal calorie 2000 protein 120 carbs 220 fat 70\n"
+            "/reminder 2026-06-28T18:30:00 Your afternoon snack reminder"
+        )
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     with SessionLocal() as db:
         summary = bot_tools.get_daily_summary(db, user_id)
-    await update.message.reply_text(
-        f"Today's summary ({summary['date']}):\n"
-        f"Calories net: {summary['total_calories']} kcal\n"
-        f"Protein: {summary['protein']} g\n"
-        f"Carbs: {summary['carbs']} g\n"
-        f"Fat: {summary['fat']} g\n"
-        f"Entries: {summary['entry_count']}"
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            f"Today's summary ({summary['date']}):\n"
+            f"Calories net: {summary['total_calories']} kcal\n"
+            f"Protein: {summary['protein']} g\n"
+            f"Carbs: {summary['carbs']} g\n"
+            f"Fat: {summary['fat']} g\n"
+            f"Entries: {summary['entry_count']}"
+        )
 
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     with SessionLocal() as db:
         profile = bot_tools.get_user_profile(db, user_id)
-    if isinstance(profile, str):
-        await update.message.reply_text(profile)
+    if not update.effective_message:
         return
-    await update.message.reply_text(
+    if isinstance(profile, str):
+        await update.effective_message.reply_text(profile)
+        return
+    await update.effective_message.reply_text(
         f"Profile for @{profile['username']}:\n"
         f"Timezone: {profile['timezone']}\n"
         f"Goals - Calories: {profile['goals']['calories']} kcal, Protein: {profile['goals']['protein']} g, "
@@ -98,12 +103,16 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     report_text = generate_weekly_report(user_id)
-    await update.message.reply_text(report_text)
+    if update.effective_message:
+        await update.effective_message.reply_text(report_text)
 
 
 async def setgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text or ""
+    message = update.effective_message
+    if not message:
+        return
+    text = message.text or ""
     args = text.replace("/setgoal", "").strip().split()
     parsed = {}
     for i in range(0, len(args) - 1, 2):
@@ -122,44 +131,56 @@ async def setgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parsed["fat_goal"] = value
 
     if not parsed:
-        await update.message.reply_text("Usage: /setgoal calorie 2000 protein 120 carbs 220 fat 70")
+        await message.reply_text("Usage: /setgoal calorie 2000 protein 120 carbs 220 fat 70")
         return
 
     with SessionLocal() as db:
         result = bot_tools.update_user_goals(db, user_id, **parsed)
-    await update.message.reply_text(result)
+    await message.reply_text(result)
 
 
 async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text or ""
+    message = update.effective_message
+    if not message:
+        return
+    text = message.text or ""
     parts = text.replace("/reminder", "").strip().split(" ", 1)
     if len(parts) < 2:
-        await update.message.reply_text("Usage: /reminder <ISO timestamp> <message>")
+        await message.reply_text("Usage: /reminder <ISO timestamp> <message>")
         return
 
     try:
         trigger_time = datetime.fromisoformat(parts[0])
-        message = parts[1].strip()
+        message_text = parts[1].strip()
     except Exception:
-        await update.message.reply_text("Please use ISO format like 2026-06-28T18:30:00 for the reminder time.")
+        await message.reply_text("Please use ISO format like 2026-06-28T18:30:00 for the reminder time.")
         return
 
     with SessionLocal() as db:
-        result = bot_tools.set_reminder(db, user_id, trigger_time, message)
-    await update.message.reply_text(result)
+        result = bot_tools.set_reminder(db, user_id, trigger_time, message_text)
+    await message.reply_text(result)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    user_text = message.text
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or "Unknown"
+
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+    except Exception:
+        pass
+    status_message = await message.reply_text("🤔 Thinking...")
 
     pending_clarification = pop_pending_clarification(user_id)
     if pending_clarification:
         clarification_text = (
             f"Previous question: {pending_clarification.get('question', '')}\n"
-            f"User clarification: {user_text or ''}\n"
+            f"User clarification: {user_text}\n"
             "Please finalize the most likely food log using the image and this clarification. "
             "If it still is not clear, ask one short follow-up question."
         )
@@ -171,18 +192,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
             model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
         )
-        await update.message.reply_text(reply_text)
+        await status_message.edit_text(reply_text)
         return
 
     reply_text = await process_user_message(user_id, username, user_text)
-    await update.message.reply_text(reply_text)
+    await status_message.edit_text(reply_text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    message = update.message
+    message = update.effective_message
     if message is None or not message.photo:
         return
+
+    try:
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+    except Exception:
+        pass
+    status_message = await message.reply_text("📸 Analyzing image...")
 
     caption = message.caption or ""
     photo = message.photo[-1]
@@ -198,7 +225,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         system_prompt=VISION_SYSTEM_PROMPT,
         model=OLLAMA_VISION_MODEL,
     )
-    await message.reply_text(reply_text)
+    await status_message.edit_text(reply_text)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):

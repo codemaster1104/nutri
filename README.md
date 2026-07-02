@@ -8,6 +8,7 @@ It combines a Telegram bot, FastAPI orchestrator, local Ollama LLM integration, 
 - Tracks meals and physical activity.
 - Stores user profiles, goals, logs, and reminders.
 - Uses Gemma 4 via Ollama for natural language understanding.
+- Looks up estimated meals against Open Food Facts when a web nutrition match is useful.
 - Sends proactive reminders and daily recaps.
 - Generates weekly nutrition trend reports.
 
@@ -16,7 +17,7 @@ It combines a Telegram bot, FastAPI orchestrator, local Ollama LLM integration, 
 - `main.py`: Orchestrator, Telegram bot handlers, and scheduler wiring.
 - `services/llm_service.py`: Ollama chat, parsing, and memory summarization helpers.
 - `services/message_service.py`: Message processing, tool-call dispatch, and clarification flow.
-- `tools/bot_tools.py`: Tool implementations for logging, summaries, profiles, reminders, and queries.
+- `tools/bot_tools.py`: Tool implementations for logging, summaries, profiles, reminders, queries, and internet nutrition lookup.
 - `database.py`: SQLite schema and session management.
 - `data_processor.py`: Weekly nutrition report and trend analysis.
 - `bot_tools.py`, `llm_service.py`, `message_service.py`: Compatibility wrappers for older imports.

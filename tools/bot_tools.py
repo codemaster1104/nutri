@@ -1,9 +1,19 @@
+import json
+import time
 from datetime import date, datetime, timedelta
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from database import Log, Reminder, User
+
+
+OPENFOODFACTS_BASE_URL = "https://world.openfoodfacts.org"
+OPENFOODFACTS_USER_AGENT = "NutriBot/1.0 (local-dev)"
 
 
 def _format_timestamp(value: datetime) -> str:
@@ -24,6 +34,190 @@ def _day_window(target_date: date, timezone_name: str | None):
     start_utc = start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     end_utc = end_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     return start_utc, end_utc
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _off_get_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    query_string = urlencode(params, doseq=True)
+    url = f"{OPENFOODFACTS_BASE_URL}{path}?{query_string}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": OPENFOODFACTS_USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = response.read().decode("utf-8")
+    except HTTPError as exc:
+        return {"error": str(exc), "status_code": exc.code, "url": url}
+    except (URLError, TimeoutError, ValueError) as exc:
+        return {"error": str(exc), "url": url}
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return {"error": f"Invalid JSON response: {exc}", "url": url}
+
+
+def _extract_nutriments(product: dict[str, Any]) -> dict[str, float | None]:
+    nutriments = product.get("nutriments") or {}
+    energy_kcal = _safe_float(nutriments.get("energy-kcal_100g") or nutriments.get("energy-kcal"))
+    if energy_kcal is None:
+        energy_kj = _safe_float(nutriments.get("energy_100g") or nutriments.get("energy"))
+        if energy_kj is not None:
+            energy_kcal = energy_kj / 4.184
+
+    return {
+        "calories": energy_kcal,
+        "protein": _safe_float(nutriments.get("proteins_100g") or nutriments.get("proteins")),
+        "carbs": _safe_float(nutriments.get("carbohydrates_100g") or nutriments.get("carbohydrates")),
+        "fat": _safe_float(nutriments.get("fat_100g") or nutriments.get("fat")),
+        "fiber": _safe_float(nutriments.get("fiber_100g") or nutriments.get("fiber")),
+        "sugars": _safe_float(nutriments.get("sugars_100g") or nutriments.get("sugars")),
+        "salt": _safe_float(nutriments.get("salt_100g") or nutriments.get("salt")),
+    }
+
+
+def _scale_nutriments(nutriments: dict[str, float | None], portion_grams: float | None) -> dict[str, float | None]:
+    if not portion_grams:
+        return nutriments
+
+    factor = portion_grams / 100.0
+    scaled: dict[str, float | None] = {}
+    for key, value in nutriments.items():
+        scaled[key] = None if value is None else value * factor
+    return scaled
+
+
+def _product_title(product: dict[str, Any]) -> str:
+    return (
+        product.get("product_name")
+        or product.get("product_name_en")
+        or product.get("generic_name")
+        or product.get("generic_name_en")
+        or product.get("product_name_fr")
+        or "Unknown product"
+    )
+
+
+# Words too short or generic to use for relevance matching.
+_STOP_WORDS = frozenset({"of", "the", "a", "an", "and", "or", "in", "with", "for", "is", "are"})
+
+
+def _is_relevant_match(product: dict[str, Any], query: str) -> bool:
+    """Return True if the product has at least one meaningful keyword in common with the query."""
+    query_words = {
+        w for w in query.lower().split()
+        if len(w) > 2 and w not in _STOP_WORDS
+    }
+    if not query_words:
+        return True  # Can't filter, let it through.
+
+    # Build a single searchable string from all relevant product fields.
+    searchable = " ".join(
+        part.lower()
+        for part in [
+            _product_title(product),
+            product.get("brands") or "",
+            product.get("categories") or "",
+            product.get("generic_name") or "",
+        ]
+        if part
+    )
+    return any(word in searchable for word in query_words)
+
+
+def _product_match(product: dict[str, Any], portion_grams: float | None) -> dict[str, Any]:
+    nutriments = _extract_nutriments(product)
+    scaled_nutriments = _scale_nutriments(nutriments, portion_grams)
+
+    return {
+        "name": _product_title(product),
+        "brand": product.get("brands") or "",
+        "url": product.get("url") or "",
+        "category": product.get("categories") or "",
+        "serving_size": product.get("serving_size") or "",
+        "serving_quantity": product.get("serving_quantity"),
+        "nutriments_per_100g": nutriments,
+        "nutriments_for_portion": scaled_nutriments,
+        "nutriscore": product.get("nutriscore_grade") or product.get("nutrition_grade_fr") or "",
+        "portion_grams": portion_grams,
+    }
+
+
+def search_online_nutrition(db: Session, user_id: int, query: str, portion_grams: float | None = None, max_results: int = 3):
+    del db, user_id
+
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return {
+            "query": "",
+            "source": "openfoodfacts",
+            "error": "Missing search query.",
+            "results": [],
+        }
+
+    limit = max(1, min(int(max_results), 5))
+    # Prefer the stable v2 Search API; fall back to the legacy CGI endpoint on failure.
+    search_payload = _off_get_json(
+        "/api/v2/search",
+        {
+            "search_terms": cleaned_query,
+            "json": 1,
+            "page_size": limit,
+            "fields": "product_name,product_name_en,generic_name,generic_name_en,product_name_fr,brands,url,categories,serving_size,serving_quantity,nutriments,nutriscore_grade,nutrition_grade_fr",
+        },
+    )
+
+    if search_payload.get("error") or search_payload.get("status_code") in (503, 502, 500):
+        # Wait before retrying to avoid hammering the server.
+        time.sleep(2)
+        search_payload = _off_get_json(
+            "/cgi/search.pl",
+            {
+                "search_terms": cleaned_query,
+                "search_simple": 1,
+                "action": "process",
+                "json": 1,
+                "page_size": limit,
+            },
+        )
+
+    if search_payload.get("error"):
+        return {
+            "query": cleaned_query,
+            "source": "openfoodfacts",
+            "status_code": search_payload.get("status_code"),
+            "error": search_payload["error"],
+            "url": search_payload.get("url", ""),
+            "results": [],
+        }
+
+    products = search_payload.get("products") or []
+    # Filter out results with no keyword overlap with the query — avoids returning
+    # completely irrelevant products (e.g. "Fromage Blanc" for a search for "amul paneer").
+    relevant_products = [p for p in products if _is_relevant_match(p, cleaned_query)]
+    results = [_product_match(product, portion_grams) for product in relevant_products[:limit]]
+
+    return {
+        "query": cleaned_query,
+        "source": "openfoodfacts",
+        "search_url": f"{OPENFOODFACTS_BASE_URL}/cgi/search.pl?{urlencode({'search_terms': cleaned_query, 'search_simple': 1, 'action': 'process', 'json': 1})}",
+        "result_count": len(results),
+        "portion_grams": portion_grams,
+        "results": results,
+    }
 
 
 def log_food(
