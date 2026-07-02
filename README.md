@@ -8,7 +8,11 @@ It combines a Telegram bot, FastAPI orchestrator, local Ollama LLM integration, 
 - Tracks meals and physical activity.
 - Stores user profiles, goals, logs, and reminders.
 - Uses Gemma 4 via Ollama for natural language understanding.
-- Looks up estimated meals against Open Food Facts when a web nutrition match is useful.
+- Looks up estimated meals against Open Food Facts (v2 Search API) when a web nutrition match is useful.
+- **Search Relevance Filtering**: Filters out irrelevant Open Food Facts search results (e.g. French cheese matching "amul paneer").
+- **LLM-Based Nutrition Fallback**: Falls back to local LLM nutrition estimates when Open Food Facts is offline (503) or yields no relevant results.
+- **Automatic Macro Estimation Safeguard**: Programmatically intercepts food logging attempts with empty/zero macros to estimate realistic values using the LLM before logging.
+- **Premium UX**: Uses native Telegram typing indicator loops to show active generation status without chat history flickering or "edited" tags.
 - Sends proactive reminders and daily recaps.
 - Generates weekly nutrition trend reports.
 
