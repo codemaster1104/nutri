@@ -60,7 +60,46 @@ def build_tool_reply(tool_name: str, tool_response: Any, args: Dict[str, Any]) -
     if tool_name == "query_logs":
         return "I pulled your recent logs."
 
+    if tool_name == "search_online_nutrition" and isinstance(tool_response, dict):
+        if tool_response.get("error"):
+            return f"I could not look up nutrition data online: {tool_response.get('error')}"
+
+        results = tool_response.get("results") or []
+        if not results:
+            return f'I could not find a close nutrition match for "{tool_response.get("query", "")}".'
+
+        top_match = results[0]
+        nutriments = top_match.get("nutriments_for_portion") or top_match.get("nutriments_per_100g") or {}
+        calories = nutriments.get("calories")
+        protein = nutriments.get("protein")
+        carbs = nutriments.get("carbs")
+        fat = nutriments.get("fat")
+        portion_grams = tool_response.get("portion_grams") or top_match.get("portion_grams")
+        portion_note = f" for about {_format_amount(portion_grams)} g" if portion_grams else ""
+        brand = top_match.get("brand")
+        brand_note = f" ({brand})" if brand else ""
+
+        return (
+            f'I found a close match for "{tool_response.get("query", "")}"{brand_note}{portion_note}: '
+            f"{top_match.get('name', 'unknown product')} — "
+            f"about {_format_amount(calories)} kcal, {_format_amount(protein)} g protein, "
+            f"{_format_amount(carbs)} g carbs, {_format_amount(fat)} g fat."
+        )
+
     return "Done."
+
+
+def _format_amount(value: Any) -> str:
+    try:
+        if value is None:
+            return "unknown"
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if abs(numeric_value - round(numeric_value)) < 1e-9:
+        return str(int(round(numeric_value)))
+    return f"{numeric_value:.1f}"
 
 
 def _parse_optional_datetime(raw_value: Optional[str], default_value: datetime) -> datetime:
@@ -176,6 +215,14 @@ async def process_user_message(
                 )
                 end_date = _parse_optional_datetime(args.get("end_date"), datetime.utcnow())
                 tool_response = bot_tools.query_logs(db, user_id, start_date, end_date)
+            elif tool_name == "search_online_nutrition":
+                tool_response = bot_tools.search_online_nutrition(
+                    db,
+                    user_id,
+                    query=args.get("query", ""),
+                    portion_grams=args.get("portion_grams"),
+                    max_results=int(args.get("max_results", 3) or 3),
+                )
             elif tool_name == "set_reminder":
                 trigger_time = _parse_optional_datetime(args.get("trigger_time"), datetime.utcnow())
                 tool_response = bot_tools.set_reminder(

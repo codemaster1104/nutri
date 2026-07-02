@@ -3,3 +3,7 @@
 .instructions.md
 .env
 nutri.db
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
