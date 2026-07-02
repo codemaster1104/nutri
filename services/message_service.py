@@ -16,6 +16,7 @@ from tools import bot_tools
 
 
 PENDING_CLARIFICATIONS: Dict[int, Dict[str, Any]] = {}
+CHAT_HISTORIES: Dict[int, list[Dict[str, Any]]] = {}
 
 
 def encode_image_bytes(image_bytes: bytes) -> str:
@@ -28,12 +29,10 @@ def pop_pending_clarification(user_id: int) -> Optional[Dict[str, Any]]:
 
 def build_tool_reply(tool_name: str, tool_response: Any, args: Dict[str, Any]) -> str:
     if tool_name == "log_food":
-        description = args.get("description", "that meal")
-        return f"Logged {description} for you."
+        return str(tool_response)
 
     if tool_name == "log_activity":
-        description = args.get("description", "that activity")
-        return f"Logged {description}."
+        return str(tool_response)
 
     if tool_name == "set_reminder":
         trigger_time = args.get("trigger_time")
@@ -171,6 +170,14 @@ async def process_user_message(
     system_prompt: str = SYSTEM_PROMPT,
     model: Optional[str] = None,
 ) -> str:
+    chat_history = CHAT_HISTORIES.setdefault(user_id, [])
+
+    def save_to_history(reply: str):
+        chat_history.append({"role": "user", "content": user_text})
+        chat_history.append({"role": "assistant", "content": reply})
+        if len(chat_history) > 10:
+            chat_history[:] = chat_history[-10:]
+
     with SessionLocal() as db:
         user = db.get(User, user_id)
         if not user:
@@ -185,6 +192,7 @@ async def process_user_message(
             system_prompt=system_prompt,
             user_text=user_text,
             memory_summary=memory_summary,
+            chat_history=chat_history,
             image_b64s=image_b64s,
             model=model,
         )
@@ -209,6 +217,7 @@ async def process_user_message(
                     "original_text": user_text,
                     "question": clarification_question,
                 }
+                save_to_history(clarification_question)
                 return clarification_question
 
         tool_call = parse_tool_call(llm_reply)
@@ -298,6 +307,7 @@ async def process_user_message(
                     updated_memory = await summarize_memory(memory_summary, user_text, final_reply)
                     if updated_memory and updated_memory != memory_summary:
                         bot_tools.update_memory_summary(db, user_id, updated_memory)
+                    save_to_history(final_reply)
                     return final_reply
             elif tool_name == "set_reminder":
                 raw_trigger_time = args.get("trigger_time")
@@ -330,4 +340,5 @@ async def process_user_message(
         if updated_memory and updated_memory != memory_summary:
             bot_tools.update_memory_summary(db, user_id, updated_memory)
 
+        save_to_history(final_reply)
         return final_reply
