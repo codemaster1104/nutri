@@ -245,7 +245,7 @@ def get_daily_summary(db: Session, user_id: int, target_date: date = None):
         .filter(
             Log.user_id == user_id,
             Log.timestamp >= start_of_day,
-            Log.timestamp <= end_of_day,
+            Log.timestamp < end_of_day,
         )
         .all()
     )

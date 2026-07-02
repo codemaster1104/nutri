@@ -260,7 +260,7 @@ async def send_daily_recap():
                 f"Carbs: {summary['carbs']} g\n"
                 f"Fat: {summary['fat']} g\n"
                 f"Entries: {summary['entry_count']}\n"
-                "Keep going-you're doing great!"
+                "Keep going — you're doing great!"
             )
             await send_bot_message(user.user_id, recap)
 
