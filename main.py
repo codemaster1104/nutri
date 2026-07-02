@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -27,6 +29,30 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Nutri Omnipresent Nutritionist", version="1.0.0")
 bot_app = None
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+@asynccontextmanager
+async def typing_action(bot, chat_id, action="typing", interval=4.0):
+    """Keep sending typing chat action in the background while processing."""
+    async def keep_typing():
+        try:
+            while True:
+                await bot.send_chat_action(chat_id=chat_id, action=action)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning("Error in typing loop: %s", e)
+
+    task = asyncio.create_task(keep_typing())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def send_bot_message(chat_id: int, text: str):
@@ -170,33 +196,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or update.effective_user.first_name or "Unknown"
 
-    try:
-        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
-    except Exception:
-        pass
-    status_message = await message.reply_text("🤔 Thinking...")
+    async with typing_action(context.bot, message.chat_id, "typing"):
+        pending_clarification = pop_pending_clarification(user_id)
+        if pending_clarification:
+            clarification_text = (
+                f"Previous question: {pending_clarification.get('question', '')}\n"
+                f"User clarification: {user_text}\n"
+                "Please finalize the most likely food log using the image and this clarification. "
+                "If it still is not clear, ask one short follow-up question."
+            )
+            reply_text = await process_user_message(
+                user_id,
+                username,
+                clarification_text,
+                image_b64s=pending_clarification.get("image_b64s"),
+                system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
+                model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
+            )
+            await message.reply_text(reply_text)
+            return
 
-    pending_clarification = pop_pending_clarification(user_id)
-    if pending_clarification:
-        clarification_text = (
-            f"Previous question: {pending_clarification.get('question', '')}\n"
-            f"User clarification: {user_text}\n"
-            "Please finalize the most likely food log using the image and this clarification. "
-            "If it still is not clear, ask one short follow-up question."
-        )
-        reply_text = await process_user_message(
-            user_id,
-            username,
-            clarification_text,
-            image_b64s=pending_clarification.get("image_b64s"),
-            system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
-            model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
-        )
-        await status_message.edit_text(reply_text)
-        return
-
-    reply_text = await process_user_message(user_id, username, user_text)
-    await status_message.edit_text(reply_text)
+        reply_text = await process_user_message(user_id, username, user_text)
+        await message.reply_text(reply_text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,27 +226,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message is None or not message.photo:
         return
 
-    try:
-        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
-    except Exception:
-        pass
-    status_message = await message.reply_text("📸 Analyzing image...")
+    async with typing_action(context.bot, message.chat_id, "typing"):
+        caption = message.caption or ""
+        photo = message.photo[-1]
+        telegram_file = await photo.get_file()
+        image_bytes = await telegram_file.download_as_bytearray()
+        image_b64 = encode_image_bytes(bytes(image_bytes))
 
-    caption = message.caption or ""
-    photo = message.photo[-1]
-    telegram_file = await photo.get_file()
-    image_bytes = await telegram_file.download_as_bytearray()
-    image_b64 = encode_image_bytes(bytes(image_bytes))
-
-    reply_text = await process_user_message(
-        user_id=user.id,
-        username=user.username or user.first_name or "Unknown",
-        user_text=caption or "Please analyze the attached image.",
-        image_b64s=[image_b64],
-        system_prompt=VISION_SYSTEM_PROMPT,
-        model=OLLAMA_VISION_MODEL,
-    )
-    await status_message.edit_text(reply_text)
+        reply_text = await process_user_message(
+            user_id=user.id,
+            username=user.username or user.first_name or "Unknown",
+            user_text=caption or "Please analyze the attached image.",
+            image_b64s=[image_b64],
+            system_prompt=VISION_SYSTEM_PROMPT,
+            model=OLLAMA_VISION_MODEL,
+        )
+        await message.reply_text(reply_text)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
