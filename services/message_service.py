@@ -135,6 +135,34 @@ async def _llm_nutrition_fallback(query: str, portion_grams: Optional[float]) ->
     return await chat_with_llm(messages)
 
 
+async def _estimate_macros_for_description(description: str) -> dict[str, float]:
+    """Estimate macros using the local LLM if they were not provided in the tool call."""
+    prompt = (
+        f"Estimate the approximate nutritional macros for this food: \"{description}\".\n"
+        "Provide calories, protein, carbs, and fat.\n"
+        "Return ONLY a JSON object with keys 'calories', 'protein', 'carbs', and 'fat' as numbers.\n"
+        "Do not write any markdown code blocks or explanation text. Just return the JSON object.\n"
+        "Example: {\"calories\": 250, \"protein\": 15, \"carbs\": 30, \"fat\": 8}"
+    )
+    messages = [
+        {"role": "system", "content": "You are a professional nutritionist. Return only pure JSON."},
+        {"role": "user", "content": prompt},
+    ]
+    reply = await chat_with_llm(messages)
+    data = parse_structured_reply(reply)
+    if data:
+        try:
+            return {
+                "calories": float(data.get("calories", 0)),
+                "protein": float(data.get("protein", 0)),
+                "carbs": float(data.get("carbs", 0)),
+                "fat": float(data.get("fat", 0)),
+            }
+        except (TypeError, ValueError):
+            pass
+    return {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+
+
 async def process_user_message(
     user_id: int,
     username: str,
@@ -191,14 +219,29 @@ async def process_user_message(
             args = tool_call.get("args", {})
 
             if tool_name == "log_food":
+                calories = float(args.get("calories") or 0)
+                protein = float(args.get("protein") or 0)
+                carbs = float(args.get("carbs") or 0)
+                fat = float(args.get("fat") or 0)
+
+                # Fallback: estimate macros if they are all zero and description is not a zero-calorie drink/item
+                desc_lower = (args.get("description") or "").lower()
+                is_zero_cal_liquid = any(x in desc_lower for x in ["water", "black coffee", "green tea", "diet coke", "coke zero", "diet soda"])
+                if calories == 0.0 and protein == 0.0 and carbs == 0.0 and fat == 0.0 and not is_zero_cal_liquid:
+                    est = await _estimate_macros_for_description(args.get("description", ""))
+                    calories = est["calories"]
+                    protein = est["protein"]
+                    carbs = est["carbs"]
+                    fat = est["fat"]
+
                 tool_response = bot_tools.log_food(
                     db,
                     user_id,
                     description=args.get("description", ""),
-                    calories=float(args.get("calories", 0)),
-                    protein=float(args.get("protein", 0)),
-                    carbs=float(args.get("carbs", 0)),
-                    fat=float(args.get("fat", 0)),
+                    calories=calories,
+                    protein=protein,
+                    carbs=carbs,
+                    fat=fat,
                     amount=float(args.get("amount", 1)),
                     unit=args.get("unit", "portion"),
                 )
