@@ -11,12 +11,15 @@ It combines a Telegram bot, FastAPI orchestrator, local Ollama LLM integration, 
 - Sends proactive reminders and daily recaps.
 - Generates weekly nutrition trend reports.
 
-## Core files
+## Core structure
 
-- `main.py`: Orchestrator, Telegram bot handlers, scheduler, and LLM integration.
-- `bot_tools.py`: Tool implementations for logging, summaries, profiles, reminders, and queries.
+- `main.py`: Orchestrator, Telegram bot handlers, and scheduler wiring.
+- `services/llm_service.py`: Ollama chat, parsing, and memory summarization helpers.
+- `services/message_service.py`: Message processing, tool-call dispatch, and clarification flow.
+- `tools/bot_tools.py`: Tool implementations for logging, summaries, profiles, reminders, and queries.
 - `database.py`: SQLite schema and session management.
 - `data_processor.py`: Weekly nutrition report and trend analysis.
+- `bot_tools.py`, `llm_service.py`, `message_service.py`: Compatibility wrappers for older imports.
 - `.agents/nutri_agent.md`: Local LLM instruction guidance for Gemma 4.
 - `.instructions.md`: Project aim and planning summary for assistants.
 
