@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 
@@ -55,12 +56,25 @@ async def typing_action(bot, chat_id, action="typing", interval=4.0):
             pass
 
 
+def markdown_to_html(text: str) -> str:
+    """Safely convert basic Markdown formatting (bold, inline code) to Telegram HTML."""
+    if not text:
+        return ""
+    # 1. Escape HTML special characters
+    html = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 2. Convert **bold** to <b>bold</b>
+    html = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", html)
+    # 3. Convert `code` to <code>code</code>
+    html = re.sub(r"`(.*?)`", r"<code>\1</code>", html)
+    return html
+
+
 async def send_bot_message(chat_id: int, text: str):
     if bot_app is None:
         logger.warning("Bot application is not initialized yet.")
         return
     try:
-        await bot_app.bot.send_message(chat_id=chat_id, text=text)
+        await bot_app.bot.send_message(chat_id=chat_id, text=markdown_to_html(text), parse_mode="HTML")
     except Exception as e:
         logger.error("Failed to send Telegram message: %s", e)
 
@@ -213,11 +227,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 system_prompt=pending_clarification.get("system_prompt", VISION_SYSTEM_PROMPT),
                 model=pending_clarification.get("model", OLLAMA_VISION_MODEL),
             )
-            await message.reply_text(reply_text)
+            await message.reply_text(markdown_to_html(reply_text), parse_mode="HTML")
             return
 
         reply_text = await process_user_message(user_id, username, user_text)
-        await message.reply_text(reply_text)
+        await message.reply_text(markdown_to_html(reply_text), parse_mode="HTML")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,7 +255,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system_prompt=VISION_SYSTEM_PROMPT,
             model=OLLAMA_VISION_MODEL,
         )
-        await message.reply_text(reply_text)
+        await message.reply_text(markdown_to_html(reply_text), parse_mode="HTML")
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):

@@ -121,6 +121,7 @@ async def run_llm_with_optional_images(
     system_prompt: str,
     user_text: str,
     memory_summary: str,
+    chat_history: Optional[list[Dict[str, Any]]] = None,
     image_b64s: Optional[list[str]] = None,
     model: Optional[str] = None,
 ) -> str:
@@ -130,11 +131,16 @@ async def run_llm_with_optional_images(
             "role": "system",
             "content": f"User memory summary:\n{memory_summary or 'No long-term memory yet.'}",
         },
-        {"role": "user", "content": user_text or "Analyze the image and respond helpfully."},
     ]
 
+    if chat_history:
+        messages.extend(chat_history)
+
+    new_user_message: Dict[str, Any] = {"role": "user", "content": user_text or "Analyze the image and respond helpfully."}
     if image_b64s:
-        messages[-1]["images"] = image_b64s
+        new_user_message["images"] = image_b64s
+
+    messages.append(new_user_message)
 
     return await chat_with_llm(messages, model=model)
 
