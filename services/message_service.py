@@ -177,13 +177,21 @@ async def process_user_message(
                 end_date = _parse_optional_datetime(args.get("end_date"), datetime.utcnow())
                 tool_response = bot_tools.query_logs(db, user_id, start_date, end_date)
             elif tool_name == "set_reminder":
-                trigger_time = _parse_optional_datetime(args.get("trigger_time"), datetime.utcnow())
-                tool_response = bot_tools.set_reminder(
-                    db,
-                    user_id,
-                    trigger_time,
-                    args.get("message", "Reminder from Nutri"),
-                )
+                raw_trigger_time = args.get("trigger_time")
+                if not raw_trigger_time:
+                    tool_response = "Please provide a trigger_time (ISO timestamp) for the reminder."
+                else:
+                    try:
+                        trigger_time = datetime.fromisoformat(str(raw_trigger_time))
+                    except ValueError:
+                        tool_response = "Invalid trigger_time format. Please provide an ISO timestamp."
+                    else:
+                        tool_response = bot_tools.set_reminder(
+                            db,
+                            user_id,
+                            trigger_time,
+                            args.get("message", "Reminder from Nutri"),
+                        )
             else:
                 tool_response = f"I don't have a tool named {tool_name}."
 
